@@ -520,7 +520,30 @@ func messageToolNames[M adk.MessageType](msg M) []string {
 }
 
 func hasTopicMemoryInjected[M adk.MessageType](msgs []M) bool {
-	for _, msg := range msgs {
+	queryIdx := lastUserQueryMessageIndex(msgs)
+	if queryIdx < 0 {
+		return false
+	}
+	for i := queryIdx - 1; i >= 0; i-- {
+		msg := msgs[i]
+		if isNilMessage(msg) {
+			continue
+		}
+		if !isAutomemoryReminderMessage(msg) {
+			break
+		}
+		if isTopicMemoryMessage(msg) {
+			return true
+		}
+	}
+	for i := queryIdx + 1; i < len(msgs); i++ {
+		msg := msgs[i]
+		if isNilMessage(msg) {
+			continue
+		}
+		if !isAutomemoryReminderMessage(msg) {
+			break
+		}
 		if isTopicMemoryMessage(msg) {
 			return true
 		}

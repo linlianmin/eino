@@ -133,6 +133,15 @@ func countTopicMemoryMessages(msgs []*schema.Message) int {
 	return count
 }
 
+func lastTopicMemoryContent(msgs []*schema.Message) string {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if isTopicMemoryMessage(msgs[i]) {
+			return msgs[i].Content
+		}
+	}
+	return ""
+}
+
 func TestMiddleware_IndexInjection_Empty(t *testing.T) {
 	ctx := context.Background()
 	b := NewInMemoryBackend()
@@ -483,6 +492,43 @@ func (m *toolCallSelectionModel) Stream(ctx context.Context, input []*schema.Mes
 }
 
 func (m *toolCallSelectionModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+
+type sequentialSelectionModel struct {
+	calls int32
+	paths []string
+}
+
+func (m *sequentialSelectionModel) Generate(_ context.Context, _ []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	idx := int(atomic.AddInt32(&m.calls, 1) - 1)
+	path := ""
+	if idx < len(m.paths) {
+		path = m.paths[idx]
+	} else if len(m.paths) > 0 {
+		path = m.paths[len(m.paths)-1]
+	}
+	return schema.AssistantMessage("", []schema.ToolCall{
+		{
+			ID:   fmt.Sprintf("select-%d", idx+1),
+			Type: "function",
+			Function: schema.FunctionCall{
+				Name:      topicSelectionToolName,
+				Arguments: fmt.Sprintf(`{"selected_memories":[%q]}`, path),
+			},
+		},
+	}), nil
+}
+
+func (m *sequentialSelectionModel) Stream(ctx context.Context, input []*schema.Message, _ ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	msg, err := m.Generate(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+}
+
+func (m *sequentialSelectionModel) WithTools(_ []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
 	return m, nil
 }
 
@@ -1160,16 +1206,121 @@ func TestMiddleware_BeforeAgent_TopicMemoryInjectedOncePerSession(t *testing.T) 
 	require.Equal(t, 1, countMemoryIndexMessages(out1.AgentInput.Messages))
 	require.Equal(t, 1, countTopicMemoryMessages(out1.AgentInput.Messages))
 
-	nextMessages := append([]*schema.Message{}, out1.AgentInput.Messages...)
-	nextMessages = append(nextMessages, schema.AssistantMessage("ack", nil), schema.UserMessage("How to debug again?"))
 	_, out2, err := mw.BeforeAgent(ctx, &adk.ChatModelAgentContext[*schema.Message]{
 		Instruction: out1.Instruction,
-		AgentInput:  &adk.AgentInput{Messages: nextMessages},
+		AgentInput:  &adk.AgentInput{Messages: out1.AgentInput.Messages},
 	})
 	require.NoError(t, err)
 	require.EqualValues(t, 1, atomic.LoadInt32(&selModel.calls))
 	require.Equal(t, 1, countMemoryIndexMessages(out2.AgentInput.Messages))
 	require.Equal(t, 1, countTopicMemoryMessages(out2.AgentInput.Messages))
+}
+
+func TestMiddleware_BeforeAgent_TopicMemoryReinjectedOnNewUserQuery(t *testing.T) {
+	ctx := context.Background()
+	b := NewInMemoryBackend()
+	now := time.Now()
+	b.put("/mem/MEMORY.md", "- [refund.md](refund.md)\n- [appointment.md](appointment.md)\n", now)
+	b.put("/mem/refund.md", "---\ndescription: refund rules\n---\nrefund within 7 days\n", now)
+	b.put("/mem/appointment.md", "---\ndescription: appointment change\n---\nchange booking 24h ahead\n", now)
+
+	selModel := &sequentialSelectionModel{paths: []string{"refund.md", "appointment.md"}}
+	mw, err := New(ctx, &Config[*schema.Message]{
+		MemoryDirectory: "/mem",
+		MemoryBackend:   b,
+		Model:           selModel,
+		Read: &ReadConfig[*schema.Message]{
+			Mode: ReadModeSync,
+			TopicSelection: &TopicSelectionConfig{
+				TopK: 1,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	_, out1, err := mw.BeforeAgent(ctx, &adk.ChatModelAgentContext[*schema.Message]{
+		Instruction: "base",
+		AgentInput:  &adk.AgentInput{Messages: []adk.Message{schema.UserMessage("退款规则")}},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, atomic.LoadInt32(&selModel.calls))
+	require.Equal(t, 1, countMemoryIndexMessages(out1.AgentInput.Messages))
+	require.Equal(t, 1, countTopicMemoryMessages(out1.AgentInput.Messages))
+	require.Contains(t, lastTopicMemoryContent(out1.AgentInput.Messages), "refund within 7 days")
+
+	nextMessages := append([]*schema.Message{}, out1.AgentInput.Messages...)
+	nextMessages = append(nextMessages, schema.AssistantMessage("ack", nil), schema.UserMessage("怎么修改预约时间"))
+	_, out2, err := mw.BeforeAgent(ctx, &adk.ChatModelAgentContext[*schema.Message]{
+		Instruction: out1.Instruction,
+		AgentInput:  &adk.AgentInput{Messages: nextMessages},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, atomic.LoadInt32(&selModel.calls))
+	require.Equal(t, 1, countMemoryIndexMessages(out2.AgentInput.Messages))
+	require.Equal(t, 2, countTopicMemoryMessages(out2.AgentInput.Messages))
+	require.Contains(t, lastTopicMemoryContent(out2.AgentInput.Messages), "change booking 24h ahead")
+}
+
+func TestMiddleware_BeforeAgent_AsyncTopicMemoryReinjectedOnNewUserQuery(t *testing.T) {
+	ctx := context.Background()
+	b := NewInMemoryBackend()
+	now := time.Now()
+	b.put("/mem/MEMORY.md", "- [refund.md](refund.md)\n- [appointment.md](appointment.md)\n", now)
+	b.put("/mem/refund.md", "---\ndescription: refund rules\n---\nrefund within 7 days\n", now)
+	b.put("/mem/appointment.md", "---\ndescription: appointment change\n---\nchange booking 24h ahead\n", now)
+
+	selModel := &sequentialSelectionModel{paths: []string{"refund.md", "appointment.md"}}
+	mw, err := New(ctx, &Config[*schema.Message]{
+		MemoryDirectory: "/mem",
+		MemoryBackend:   b,
+		Model:           selModel,
+		Read: &ReadConfig[*schema.Message]{
+			Mode: ReadModeAsync,
+			TopicSelection: &TopicSelectionConfig{
+				TopK: 1,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	ctx1, out1, err := mw.BeforeAgent(ctx, &adk.ChatModelAgentContext[*schema.Message]{
+		Instruction: "base",
+		AgentInput:  &adk.AgentInput{Messages: []adk.Message{schema.UserMessage("退款规则")}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, countMemoryIndexMessages(out1.AgentInput.Messages))
+	require.Equal(t, 0, countTopicMemoryMessages(out1.AgentInput.Messages))
+
+	st := &adk.ChatModelAgentState{Messages: append([]adk.Message{}, out1.AgentInput.Messages...)}
+	require.Eventually(t, func() bool {
+		_, next, err := mw.BeforeModelRewriteState(ctx1, st, nil)
+		require.NoError(t, err)
+		st = next
+		return countTopicMemoryMessages(st.Messages) == 1
+	}, 2*time.Second, 10*time.Millisecond)
+	require.EqualValues(t, 1, atomic.LoadInt32(&selModel.calls))
+	require.Contains(t, lastTopicMemoryContent(st.Messages), "refund within 7 days")
+
+	nextMessages := append([]*schema.Message{}, st.Messages...)
+	nextMessages = append(nextMessages, schema.AssistantMessage("ack", nil), schema.UserMessage("怎么修改预约时间"))
+	ctx2, out2, err := mw.BeforeAgent(context.Background(), &adk.ChatModelAgentContext[*schema.Message]{
+		Instruction: out1.Instruction,
+		AgentInput:  &adk.AgentInput{Messages: nextMessages},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, countMemoryIndexMessages(out2.AgentInput.Messages))
+	require.Equal(t, 1, countTopicMemoryMessages(out2.AgentInput.Messages))
+
+	st2 := &adk.ChatModelAgentState{Messages: append([]adk.Message{}, out2.AgentInput.Messages...)}
+	require.Eventually(t, func() bool {
+		_, next, err := mw.BeforeModelRewriteState(ctx2, st2, nil)
+		require.NoError(t, err)
+		st2 = next
+		return countTopicMemoryMessages(st2.Messages) == 2
+	}, 2*time.Second, 10*time.Millisecond)
+	require.EqualValues(t, 2, atomic.LoadInt32(&selModel.calls))
+	require.Equal(t, 1, countMemoryIndexMessages(st2.Messages))
+	require.Contains(t, lastTopicMemoryContent(st2.Messages), "change booking 24h ahead")
 }
 
 func TestMiddleware_LastUserMessageSkipsSystemReminderPrefix(t *testing.T) {

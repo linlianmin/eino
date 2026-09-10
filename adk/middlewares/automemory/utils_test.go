@@ -72,6 +72,46 @@ func TestConcatMessageStream_ConcatError(t *testing.T) {
 	assert.Contains(t, err.Error(), "different roles")
 }
 
+func TestHasTopicMemoryInjected_CurrentTurnOnly(t *testing.T) {
+	index := newMemoryIndexMessage[*schema.Message]("<!-- automemory:index -->\nindex")
+	topicRefund := newMemoryMessage[*schema.Message]("<!-- automemory -->\nrefund rules")
+	topicAppointment := newMemoryMessage[*schema.Message]("<!-- automemory -->\nappointment change")
+	legacyTopic := schema.UserMessage("<!-- automemory -->\nlegacy refund topic")
+
+	require.False(t, hasTopicMemoryInjected([]*schema.Message{
+		schema.UserMessage("退款规则"),
+	}))
+	require.True(t, hasTopicMemoryInjected([]*schema.Message{
+		index, topicRefund, schema.UserMessage("退款规则"),
+	}))
+	require.True(t, hasTopicMemoryInjected([]*schema.Message{
+		legacyTopic, schema.UserMessage("退款规则"),
+	}))
+	require.False(t, hasTopicMemoryInjected([]*schema.Message{
+		index, topicRefund, schema.UserMessage("退款规则"),
+		schema.AssistantMessage("ack", nil),
+		schema.UserMessage("怎么修改预约时间"),
+	}))
+	require.False(t, hasTopicMemoryInjected([]*schema.Message{
+		index, schema.UserMessage("退款规则"), topicRefund,
+		schema.AssistantMessage("ack", nil),
+		schema.UserMessage("怎么修改预约时间"),
+	}))
+	require.True(t, hasTopicMemoryInjected([]*schema.Message{
+		index, schema.UserMessage("退款规则"), topicRefund,
+	}))
+	require.True(t, hasTopicMemoryInjected([]*schema.Message{
+		index, topicRefund, schema.UserMessage("退款规则"),
+		schema.AssistantMessage("ack", nil),
+		topicAppointment, schema.UserMessage("怎么修改预约时间"),
+	}))
+	require.True(t, hasMemoryIndexInjected([]*schema.Message{
+		index, topicRefund, schema.UserMessage("退款规则"),
+		schema.AssistantMessage("ack", nil),
+		schema.UserMessage("怎么修改预约时间"),
+	}))
+}
+
 func TestConcatMessageStream_WithToolCalls(t *testing.T) {
 	chunks := []*schema.Message{
 		{Role: schema.Assistant, Content: "thinking..."},
