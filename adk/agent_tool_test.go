@@ -1239,3 +1239,23 @@ func TestCrossTypeAgentToolGracefulError(t *testing.T) {
 			"Error should mention cross-message-type incompatibility")
 	}
 }
+
+func TestAgentTool_NilEventFromCustomAgent(t *testing.T) {
+	ctx := context.Background()
+
+	agentTool_ := NewAgentTool(ctx, &nilEventTestAgent{name: "NilEventAgent"})
+	output, err := agentTool_.(tool.InvokableTool).InvokableRun(ctx, `{"request":"hello"}`)
+
+	assert.Empty(t, output)
+	assertNilEventContractError(t, err, "NilEventAgent")
+}
+
+func TestTypedAgentTool_NilEventFromCustomAgenticAgent(t *testing.T) {
+	ctx := context.Background()
+
+	agentTool_ := NewTypedAgentTool[*schema.AgenticMessage](ctx, &nilEventTestAgenticAgent{name: "NilEventAgenticAgent"})
+	output, err := agentTool_.(tool.InvokableTool).InvokableRun(ctx, `{"request":"hello"}`)
+
+	assert.Empty(t, output)
+	assertNilEventContractError(t, err, "NilEventAgenticAgent")
+}

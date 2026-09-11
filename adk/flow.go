@@ -509,6 +509,15 @@ func (a *flowAgent) run(
 			break
 		}
 
+		if event == nil {
+			generator.Send(&AgentEvent{
+				AgentName: a.Name(ctx),
+				RunPath:   runCtx.RunPath,
+				Err:       newNilAgentEventError(a.Name(ctx), a.Agent),
+			})
+			return
+		}
+
 		// RunPath ownership: the eino framework sets RunPath exactly once.
 		// If event.RunPath is already set (e.g., by agentTool), we don't modify it.
 		// If event.RunPath is nil/empty, we set it to the current runCtx.RunPath.
@@ -579,6 +588,17 @@ func (a *flowAgent) run(
 			generator.Send(subEvent)
 		}
 	}
+}
+
+// newNilAgentEventError builds the contract error reported when an agent yields a nil event
+// through its AsyncIterator. The flow wrapper is the central boundary through which every
+// agent event passes, so rejecting nil here protects all downstream consumers (Runner,
+// AgentTool, workflows, callbacks) from dereferencing it.
+func newNilAgentEventError(agentName string, agent any) error {
+	return fmt.Errorf("agent '%s' (type %T) sent a nil event through its AsyncIterator: "+
+		"every event passed to AsyncGenerator.Send must be a non-nil event. "+
+		"Send an event with Output, Action or Err set, or close the generator without sending",
+		agentName, agent)
 }
 
 func exactRunPathMatch(aPath, bPath []RunStep) bool {
@@ -752,6 +772,15 @@ func (a *typedFlowAgent[M]) run(
 		event, ok := aIter.Next()
 		if !ok {
 			break
+		}
+
+		if event == nil {
+			generator.Send(&TypedAgentEvent[M]{
+				AgentName: a.Name(ctx),
+				RunPath:   runCtx.RunPath,
+				Err:       newNilAgentEventError(a.Name(ctx), a.TypedAgent),
+			})
+			return
 		}
 
 		if len(event.RunPath) == 0 {
