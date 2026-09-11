@@ -387,3 +387,81 @@ func TestTransferToAgentWithDesignatedCallback(t *testing.T) {
 
 	assert.Equal(t, 1, childCallbackCount, "designated callback for ChildAgent should fire exactly once during transfer")
 }
+
+// nilEventTestAgent is a custom Agent that violates the event contract by sending
+// a nil event through its AsyncIterator before closing the generator.
+type nilEventTestAgent struct {
+	name string
+}
+
+func (a *nilEventTestAgent) Name(_ context.Context) string        { return a.name }
+func (a *nilEventTestAgent) Description(_ context.Context) string { return "sends a nil event" }
+func (a *nilEventTestAgent) Run(_ context.Context, _ *AgentInput, _ ...AgentRunOption) *AsyncIterator[*AgentEvent] {
+	iter, gen := NewAsyncIteratorPair[*AgentEvent]()
+	go func() {
+		defer gen.Close()
+		gen.Send(nil)
+	}()
+	return iter
+}
+
+// nilEventTestAgenticAgent is the AgenticMessage counterpart of nilEventTestAgent.
+type nilEventTestAgenticAgent struct {
+	name string
+}
+
+func (a *nilEventTestAgenticAgent) Name(_ context.Context) string        { return a.name }
+func (a *nilEventTestAgenticAgent) Description(_ context.Context) string { return "sends a nil event" }
+func (a *nilEventTestAgenticAgent) Run(_ context.Context, _ *TypedAgentInput[*schema.AgenticMessage], _ ...AgentRunOption) *AsyncIterator[*TypedAgentEvent[*schema.AgenticMessage]] {
+	iter, gen := NewAsyncIteratorPair[*TypedAgentEvent[*schema.AgenticMessage]]()
+	go func() {
+		defer gen.Close()
+		gen.Send(nil)
+	}()
+	return iter
+}
+
+func assertNilEventContractError(t *testing.T, err error, agentName string) {
+	t.Helper()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "agent '"+agentName+"'")
+	assert.Contains(t, err.Error(), "sent a nil event through its AsyncIterator")
+	assert.NotContains(t, err.Error(), "panic")
+	assert.NotContains(t, err.Error(), "goroutine")
+}
+
+func TestFlowAgent_NilEventFromCustomAgent(t *testing.T) {
+	ctx := context.Background()
+	runner := NewRunner(ctx, RunnerConfig{Agent: &nilEventTestAgent{name: "NilEventAgent"}})
+
+	iter := runner.Query(ctx, "hello")
+
+	event, ok := iter.Next()
+	assert.True(t, ok)
+	assert.NotNil(t, event)
+	assertNilEventContractError(t, event.Err, "NilEventAgent")
+	assert.Equal(t, "NilEventAgent", event.AgentName)
+	assert.Equal(t, []RunStep{{agentName: "NilEventAgent"}}, event.RunPath)
+
+	_, ok = iter.Next()
+	assert.False(t, ok, "the iterator should be closed after the contract error")
+}
+
+func TestTypedFlowAgent_NilEventFromCustomAgenticAgent(t *testing.T) {
+	ctx := context.Background()
+	runner := NewTypedRunner(TypedRunnerConfig[*schema.AgenticMessage]{
+		Agent: &nilEventTestAgenticAgent{name: "NilEventAgenticAgent"},
+	})
+
+	iter := runner.Query(ctx, "hello")
+
+	event, ok := iter.Next()
+	assert.True(t, ok)
+	assert.NotNil(t, event)
+	assertNilEventContractError(t, event.Err, "NilEventAgenticAgent")
+	assert.Equal(t, "NilEventAgenticAgent", event.AgentName)
+	assert.Equal(t, []RunStep{{agentName: "NilEventAgenticAgent"}}, event.RunPath)
+
+	_, ok = iter.Next()
+	assert.False(t, ok, "the iterator should be closed after the contract error")
+}
