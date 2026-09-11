@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/cloudwego/eino/adk/internal"
@@ -284,6 +285,56 @@ func SendToolGenAction(ctx context.Context, toolName string, action *AgentAction
 	})
 }
 
+// SetReturnDirectly marks the current tool call as "return directly" at runtime.
+//
+// Once the marked tool call finishes, the ChatModelAgent terminates the ReAct loop and
+// returns that tool's result as the agent's final output, without invoking the model
+// again. This is the dynamic counterpart of ToolsConfig.ReturnDirectly: instead of
+// statically deciding by tool name at construction time, the tool (or a tool call
+// middleware) decides per call based on the execution result. Typical uses include a
+// lookup tool that hits a cache, a retrieval tool whose results are already good enough,
+// or business rules that make further LLM reasoning unnecessary.
+//
+// Where/when to use:
+//   - Invoke within a tool's Run (Invokable/Streamable) implementation, or within a tool
+//     call middleware, before the tool call returns. For streaming tools, call it before
+//     returning the stream. The tool call is identified by the ToolCallID carried in ctx.
+//   - The decision only affects the current tool call. Other calls of the same tool,
+//     in the same or later iterations, are unaffected unless they also call this function.
+//   - When several tool calls in the same iteration are marked (via this function or
+//     ToolsConfig.ReturnDirectly), the result of the last marked call is returned,
+//     matching the behavior of ToolsConfig.ReturnDirectly.
+//
+// Limitation:
+//   - This function is intended for use within ChatModelAgent runs only. It relies on
+//     ChatModelAgent's internal state, which is not available in other agent types.
+//     It returns an error when called outside a tool call or outside a ChatModelAgent run.
+func SetReturnDirectly(ctx context.Context) error {
+	toolCallID := compose.GetToolCallID(ctx)
+	if toolCallID == "" {
+		return errors.New("adk.SetReturnDirectly: tool call ID not found in context, " +
+			"it must be called within a tool call of a ChatModelAgent")
+	}
+
+	err := compose.ProcessState(ctx, func(_ context.Context, st *State) error {
+		st.setReturnDirectlyToolCallID(toolCallID)
+		return nil
+	})
+	if err == nil {
+		return nil
+	}
+
+	agenticErr := compose.ProcessState(ctx, func(_ context.Context, st *agenticState) error {
+		st.setReturnDirectlyToolCallID(toolCallID)
+		return nil
+	})
+	if agenticErr == nil {
+		return nil
+	}
+
+	return fmt.Errorf("adk.SetReturnDirectly: ChatModelAgent state not found in context: %w", err)
+}
+
 type reactInput struct {
 	Messages []Message
 }
@@ -360,6 +411,7 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 		afterToolCallsNode_            = "AfterToolCalls"
 		afterToolCallsCancelCheckNode_ = "AfterToolCallsCancelCheck"
 		afterAgentNode_                = "AfterAgent"
+		toolNodeToEndConverter_        = "ToolNodeToEndConverter"
 	)
 
 	cancelCtx := config.cancelCtx
@@ -520,43 +572,38 @@ func newReact(ctx context.Context, config *reactConfig) (reactGraph, error) {
 	_ = g.AddEdge(toolNode_, afterToolCallsNode_)
 	_ = g.AddEdge(afterToolCallsNode_, afterToolCallsCancelCheckNode_)
 
-	if len(config.toolsReturnDirectly) > 0 {
-		const (
-			toolNodeToEndConverter = "ToolNodeToEndConverter"
-		)
+	// The return-directly branch is always present: besides the statically configured
+	// ToolsConfig.ReturnDirectly, any tool call may mark itself at runtime via
+	// SetReturnDirectly, so the graph topology cannot depend on the static config.
+	cvt := func(ctx context.Context, toolResults []Message) (Message, error) {
+		id, _ := getReturnDirectlyToolCallID(ctx)
 
-		cvt := func(ctx context.Context, toolResults []Message) (Message, error) {
-			id, _ := getReturnDirectlyToolCallID(ctx)
-
-			for _, msg := range toolResults {
-				if msg != nil && msg.ToolCallID == id {
-					return msg, nil
-				}
+		for _, msg := range toolResults {
+			if msg != nil && msg.ToolCallID == id {
+				return msg, nil
 			}
-
-			return nil, errors.New("return directly tool call result not found")
 		}
 
-		_ = g.AddLambdaNode(toolNodeToEndConverter, compose.InvokableLambda(cvt),
-			compose.WithNodeName(toolNodeToEndConverter))
-		_ = g.AddEdge(toolNodeToEndConverter, terminalNode)
-
-		checkReturnDirect := func(ctx context.Context, toolResults []Message) (string, error) {
-			_, ok := getReturnDirectlyToolCallID(ctx)
-
-			if ok {
-				return toolNodeToEndConverter, nil
-			}
-
-			return chatModel_, nil
-		}
-
-		returnDirectBranch := compose.NewGraphBranch(checkReturnDirect,
-			map[string]bool{toolNodeToEndConverter: true, chatModel_: true})
-		_ = g.AddBranch(afterToolCallsCancelCheckNode_, returnDirectBranch)
-	} else {
-		_ = g.AddEdge(afterToolCallsCancelCheckNode_, chatModel_)
+		return nil, errors.New("return directly tool call result not found")
 	}
+
+	_ = g.AddLambdaNode(toolNodeToEndConverter_, compose.InvokableLambda(cvt),
+		compose.WithNodeName(toolNodeToEndConverter_))
+	_ = g.AddEdge(toolNodeToEndConverter_, terminalNode)
+
+	checkReturnDirect := func(ctx context.Context, toolResults []Message) (string, error) {
+		_, ok := getReturnDirectlyToolCallID(ctx)
+
+		if ok {
+			return toolNodeToEndConverter_, nil
+		}
+
+		return chatModel_, nil
+	}
+
+	returnDirectBranch := compose.NewGraphBranch(checkReturnDirect,
+		map[string]bool{toolNodeToEndConverter_: true, chatModel_: true})
+	_ = g.AddBranch(afterToolCallsCancelCheckNode_, returnDirectBranch)
 
 	return g, nil
 }
@@ -613,6 +660,7 @@ func newAgenticReact(ctx context.Context, config *agenticReactConfig) (agenticRe
 		afterToolCallsNode_            = "AfterToolCalls"
 		afterToolCallsCancelCheckNode_ = "AfterToolCallsCancelCheck"
 		afterAgentNode_                = "AfterAgent"
+		toolNodeToEndConverter_        = "ToolNodeToEndConverter"
 	)
 
 	cancelCtx := config.cancelCtx
@@ -765,43 +813,37 @@ func newAgenticReact(ctx context.Context, config *agenticReactConfig) (agenticRe
 	_ = g.AddEdge(toolNode_, afterToolCallsNode_)
 	_ = g.AddEdge(afterToolCallsNode_, afterToolCallsCancelCheckNode_)
 
-	if len(config.toolsReturnDirectly) > 0 {
-		const (
-			toolNodeToEndConverter = "ToolNodeToEndConverter"
-		)
-
-		cvt := func(ctx context.Context, toolResults []*schema.AgenticMessage) (*schema.AgenticMessage, error) {
-			id, _ := getAgenticReturnDirectlyToolCallID(ctx)
-			for _, msg := range toolResults {
-				if msg == nil {
-					continue
-				}
-				_, callID := extractToolIdentifiers(msg)
-				if callID == id {
-					return msg, nil
-				}
+	// Always present so that SetReturnDirectly can terminate the loop at runtime
+	// regardless of the static ToolsConfig.ReturnDirectly configuration.
+	cvt := func(ctx context.Context, toolResults []*schema.AgenticMessage) (*schema.AgenticMessage, error) {
+		id, _ := getAgenticReturnDirectlyToolCallID(ctx)
+		for _, msg := range toolResults {
+			if msg == nil {
+				continue
 			}
-			return nil, errors.New("return directly tool call result not found")
-		}
-
-		_ = g.AddLambdaNode(toolNodeToEndConverter, compose.InvokableLambda(cvt),
-			compose.WithNodeName(toolNodeToEndConverter))
-		_ = g.AddEdge(toolNodeToEndConverter, terminalNode)
-
-		checkReturnDirect := func(ctx context.Context, toolResults []*schema.AgenticMessage) (string, error) {
-			_, ok := getAgenticReturnDirectlyToolCallID(ctx)
-			if ok {
-				return toolNodeToEndConverter, nil
+			_, callID := extractToolIdentifiers(msg)
+			if callID == id {
+				return msg, nil
 			}
-			return chatModel_, nil
 		}
-
-		returnDirectBranch := compose.NewGraphBranch(checkReturnDirect,
-			map[string]bool{toolNodeToEndConverter: true, chatModel_: true})
-		_ = g.AddBranch(afterToolCallsCancelCheckNode_, returnDirectBranch)
-	} else {
-		_ = g.AddEdge(afterToolCallsCancelCheckNode_, chatModel_)
+		return nil, errors.New("return directly tool call result not found")
 	}
+
+	_ = g.AddLambdaNode(toolNodeToEndConverter_, compose.InvokableLambda(cvt),
+		compose.WithNodeName(toolNodeToEndConverter_))
+	_ = g.AddEdge(toolNodeToEndConverter_, terminalNode)
+
+	checkReturnDirect := func(ctx context.Context, toolResults []*schema.AgenticMessage) (string, error) {
+		_, ok := getAgenticReturnDirectlyToolCallID(ctx)
+		if ok {
+			return toolNodeToEndConverter_, nil
+		}
+		return chatModel_, nil
+	}
+
+	returnDirectBranch := compose.NewGraphBranch(checkReturnDirect,
+		map[string]bool{toolNodeToEndConverter_: true, chatModel_: true})
+	_ = g.AddBranch(afterToolCallsCancelCheckNode_, returnDirectBranch)
 
 	return g, nil
 }
