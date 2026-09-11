@@ -10,7 +10,7 @@
 ![Stars](https://img.shields.io/github/stars/cloudwego/eino)
 ![Forks](https://img.shields.io/github/forks/cloudwego/eino)
 
-English | [中文](README.zh_CN.md)
+English | [中文](README.zh_CN.md) | [日本語](README.ja.md)
 
 # Overview
 
