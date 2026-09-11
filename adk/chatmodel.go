@@ -138,6 +138,10 @@ type ToolsConfig struct {
 
 	// ReturnDirectly specifies tools that cause the agent to return immediately when called.
 	// The map keys are tool names indicate whether the tool should trigger immediate return.
+	//
+	// This is a static, per-tool-name configuration. To decide per tool call at runtime,
+	// e.g. based on the tool's execution result, call SetReturnDirectly from within the
+	// tool's Run implementation (or a tool call middleware) instead.
 	ReturnDirectly map[string]bool
 
 	// EmitInternalEvents indicates whether internal events from agentTool should be emitted
@@ -834,8 +838,9 @@ func (a *TypedChatModelAgent[M]) applyBeforeAgent(ctx context.Context, ec *execC
 		returnDirectly: runCtx.ReturnDirectly,
 		toolSearchTool: runCtx.ToolSearchTool,
 		toolUpdated:    true,
-		rebuildGraph: (len(ec.toolsNodeConf.Tools) == 0 && len(runCtx.Tools) > 0) ||
-			(len(ec.returnDirectly) == 0 && len(runCtx.ReturnDirectly) > 0),
+		// ReturnDirectly changes never require a rebuild: the ReAct graph always contains
+		// the return-directly branch and reads the effective set at runtime.
+		rebuildGraph: len(ec.toolsNodeConf.Tools) == 0 && len(runCtx.Tools) > 0,
 	}
 
 	toolInfos, err := genToolInfos(ctx, &runtimeEC.toolsNodeConf)
